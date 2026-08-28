@@ -16,7 +16,8 @@ CeresSolver::CeresSolver()
 : nodes_(new std::unordered_map<int, Eigen::Vector3d>()),
   blocks_(new std::unordered_map<std::size_t,
     ceres::ResidualBlockId>()),
-  problem_(NULL), was_constant_set_(false)
+  problem_(NULL), was_constant_set_(false), last_iterations_(0),
+  last_cost_(0.0)
 /*****************************************************************************/
 {
 }
@@ -242,6 +243,11 @@ void CeresSolver::Compute()
 
   ceres::Solver::Summary summary;
   ceres::Solve(options_, problem_, &summary);
+  // linear solves, not num_successful_steps: that would count the initial
+  // evaluation (which solves nothing) and miss the final convergence-
+  // detecting solve
+  last_iterations_ = static_cast<int>(summary.num_linear_solves);
+  last_cost_ = summary.final_cost;
   if (debug_logging_) {
     std::cout << summary.FullReport() << '\n';
   }

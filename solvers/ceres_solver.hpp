@@ -57,6 +57,10 @@ public:
   virtual void ModifyNode(const int & unique_id, Eigen::Vector3d pose);
   // get a node's current pose yaw
   virtual void GetNodeOrientation(const int & unique_id, double & pose);
+  // minimizer iterations of the last Compute()
+  int last_iterations() const {return last_iterations_;}
+  // final cost of the last Compute() (0.5 * sum of squared residuals)
+  double last_cost() const {return last_cost_;}
 
 private:
   // karto
@@ -69,6 +73,8 @@ private:
   ceres::Problem * problem_;
   ceres::Manifold * angle_manifold_;
   bool was_constant_set_, debug_logging_;
+  int last_iterations_;
+  double last_cost_;
 
   // graph
   std::unordered_map<int, Eigen::Vector3d> * nodes_;

@@ -263,6 +263,11 @@ if(BUILD_TESTING)
     ceres_solver_plugin
     arael_solver_plugin
   )
+  add_executable(solver_benchmark test/solver_benchmark.cpp)
+  target_link_libraries(solver_benchmark
+    ceres_solver_plugin
+    arael_solver_plugin
+  )
 endif()
 endif()
 

@@ -215,6 +215,57 @@ target_link_libraries(ceres_solver_plugin PUBLIC ${CERES_LIBRARIES}
 )
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
 target_link_libraries(ceres_solver_plugin PUBLIC "${cpp_typesupport_target}")
+
+#### Arael Plugin (optional: vendored model in solvers/arael, needs a
+#### Rust toolchain; enable with -DBUILD_ARAEL_SOLVER=ON)
+option(BUILD_ARAEL_SOLVER "Build the arael solver plugin" OFF)
+if(BUILD_ARAEL_SOLVER)
+add_subdirectory(solvers/arael/cxx arael_gen)
+add_library(arael_solver_plugin solvers/arael_solver.cpp)
+list(APPEND libraries arael_solver_plugin)
+target_link_libraries(arael_solver_plugin PUBLIC
+  ${bond_TARGETS}
+  ${builtin_interfaces_TARGETS}
+  ${lifecycle_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${std_msgs_TARGETS}
+  ${std_srvs_TARGETS}
+  ${visualization_msgs_TARGETS}
+  bondcpp::bondcpp
+  interactive_markers::interactive_markers
+  message_filters::message_filters
+  pluginlib::pluginlib
+  rclcpp::rclcpp
+  rclcpp_components::component
+  rclcpp_components::component_manager
+  rclcpp_lifecycle::rclcpp_lifecycle
+  rviz_common::rviz_common
+  rviz_default_plugins::rviz_default_plugins
+  rviz_rendering::rviz_rendering
+  sensor_msgs::sensor_msgs_library
+  tf2::tf2
+  tf2_geometry_msgs::tf2_geometry_msgs
+  tf2_ros::static_transform_broadcaster_node
+  tf2_ros::tf2_ros
+  tf2_sensor_msgs::tf2_sensor_msgs
+)
+target_link_libraries(arael_solver_plugin PUBLIC ${Boost_LIBRARIES}
+                                          kartoSlamToolbox
+                                          arael::slam_toolbox_arael
+)
+target_link_libraries(arael_solver_plugin PUBLIC "${cpp_typesupport_target}")
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(arael_ceres_equivalence_test test/arael_ceres_equivalence_test.cpp)
+  target_link_libraries(arael_ceres_equivalence_test
+    ceres_solver_plugin
+    arael_solver_plugin
+  )
+endif()
+endif()
+
 pluginlib_export_plugin_description_file(slam_toolbox solver_plugins.xml)
 
 #### Tool lib for mapping

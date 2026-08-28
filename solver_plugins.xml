@@ -7,6 +7,15 @@
   </class>
 </library>
 
+<library path="arael_solver_plugin">
+  <class
+    name="solver_plugins::AraelSolver"
+    type="solver_plugins::AraelSolver"
+    base_class_type="karto::ScanSolver">
+    <description> Arael Optimizer for Slam Toolbox </description>
+  </class>
+</library>
+
 <!-- <library path="libGTSAM_solver_plugin">
   <class type="solver_plugins::GTSAMSolver" base_class_type="karto::ScanSolver">
     <description> GTSAM Optimizer for karto </description>

@@ -133,6 +133,8 @@ Then I generated plugins for a few different solvers that people might be intere
 
 GTSAM/G2O/SPA is currently "unsupported" although all the code is there. They don't outperform Ceres settings I describe below so I stopped compiling them to save on build time, but they're there and work if you would like to use them. PRs to implement other optimizer plugins are welcome.
 
+An optional arael solver plugin is also available: build with `-DBUILD_ARAEL_SOLVER=ON` (needs a Rust toolchain) and select with `solver_plugin: solver_plugins::AraelSolver`. See [solvers/arael/README.md](solvers/arael/README.md) for details.
+
 ### Map Merging - Example uses of serialized raw data & posegraphs
 
 #### Kinematic

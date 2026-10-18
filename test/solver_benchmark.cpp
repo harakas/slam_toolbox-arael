@@ -3,7 +3,7 @@
  * (g2o format). Feeds the graph through the real solver interface and
  * times Compute().
  *
- *   solver_benchmark <file.g2o> [--reps N] [--every K]
+ *   solver_benchmark <file.g2o> [--reps N] [--warmup N] [--every K]
  *
  * Default is one batch solve per rep for each plugin, interleaved.
  * --every K additionally re-solves after every K constraints while the
@@ -144,14 +144,14 @@ double Cost(const std::map<int, karto::Pose2> & poses, const G2oGraph & g)
 class Rig
 {
 public:
-  Rig(const std::string & plugin, bool verbose)
+  Rig(const std::string & plugin, bool verbose, const std::string & tag = "")
   {
     if (plugin == "ceres") {
       solver_.reset(new solver_plugins::CeresSolver());
     } else {
       solver_.reset(new solver_plugins::AraelSolver());
     }
-    node_ = std::make_shared<rclcpp_lifecycle::LifecycleNode>("bench_" + plugin);
+    node_ = std::make_shared<rclcpp_lifecycle::LifecycleNode>("bench_" + plugin + tag);
     node_->declare_parameter("debug_logging", rclcpp::ParameterValue(verbose));
     solver_->Configure(node_);
   }
@@ -236,15 +236,27 @@ private:
   std::map<int, karto::Vertex<karto::LocalizedRangeScan> *> vertices_;
 };
 
-void RunBatch(const std::string & plugin, const G2oGraph & g, bool verbose)
+void AddGraph(Rig & rig, const G2oGraph & g)
 {
-  Rig rig(plugin, verbose);
   for (size_t i = 0; i < g.poses.size(); ++i) {
     rig.AddNode(static_cast<int>(i), g.poses[i]);
   }
   for (const auto & e : g.edges) {
     rig.AddConstraint(e);
   }
+}
+
+void RunBatch(const std::string & plugin, const G2oGraph & g, int warmups, bool verbose)
+{
+  // untimed solves of the same graph, each with its own solver, so the
+  // timed one leaves out what a process pays once
+  for (int w = 0; w < warmups; ++w) {
+    Rig warm(plugin, verbose, "_warmup" + std::to_string(w));
+    AddGraph(warm, g);
+    warm.Solve();
+  }
+  Rig rig(plugin, verbose);
+  AddGraph(rig, g);
   std::map<int, karto::Pose2> init;
   for (size_t i = 0; i < g.poses.size(); ++i) {
     init[static_cast<int>(i)] = g.poses[i];
@@ -332,6 +344,8 @@ void PrintHelp(const char * prog)
     "\n"
     "options:\n"
     "  --reps N     interleaved batch-solve pairs (default 3)\n"
+    "  --warmup N   untimed batch solves of the same graph in each run\n"
+    "               before the timed one (default 1)\n"
     "  --every K    also grow the graph and re-solve every K constraints,\n"
     "               printing a nodes:ms curve per solver (default off)\n"
     "  --verbose    solver debug output (Ceres full report, Arael\n"
@@ -346,7 +360,7 @@ void PrintHelp(const char * prog)
 
 int main(int argc, char ** argv)
 {
-  int reps = 3, every = 0;
+  int reps = 3, every = 0, warmups = 1;
   bool verbose = false;
   const char * path = nullptr;
   for (int i = 1; i < argc; ++i) {
@@ -359,6 +373,8 @@ int main(int argc, char ** argv)
       reps = std::atoi(argv[++i]);
     } else if (!std::strcmp(argv[i], "--every") && i + 1 < argc) {
       every = std::atoi(argv[++i]);
+    } else if (!std::strcmp(argv[i], "--warmup") && i + 1 < argc) {
+      warmups = std::atoi(argv[++i]);
     } else if (argv[i][0] != '-' && !path) {
       path = argv[i];
     } else {
@@ -366,7 +382,7 @@ int main(int argc, char ** argv)
       return 1;
     }
   }
-  if (!path) {
+  if (!path || reps < 1 || warmups < 0) {
     PrintHelp(argv[0]);
     return 1;
   }
@@ -376,6 +392,10 @@ int main(int argc, char ** argv)
     std::fprintf(stderr, "failed to load %s\n", path);
     return 1;
   }
+  std::printf(
+    "graph %s nodes=%zu edges=%zu reps=%d warmup=%d every=%d\n",
+    path, g.poses.size(), g.edges.size(), reps, warmups, every);
+  std::fflush(stdout);
 
   // Quiet Ceres' per-process warnings (num_threads clamping) and the
   // uninitialized-logging banner; children inherit the initialized state
@@ -383,8 +403,8 @@ int main(int argc, char ** argv)
   google::InitGoogleLogging(argv[0]);
 
   for (int r = 0; r < reps; ++r) {
-    RunForked("ceres", [&] {RunBatch("ceres", g, verbose);});
-    RunForked("arael", [&] {RunBatch("arael", g, verbose);});
+    RunForked("ceres", [&] {RunBatch("ceres", g, warmups, verbose);});
+    RunForked("arael", [&] {RunBatch("arael", g, warmups, verbose);});
   }
   if (every > 0) {
     RunForked("ceres", [&] {RunIncremental("ceres", g, every, verbose);});

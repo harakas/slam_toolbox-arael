@@ -5,7 +5,7 @@
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use arael::covariance::{CovAssembly, CovMode, CovOptions, CovOrdering, Covariance};
+use arael::covariance::{CovAssembly, CovError, CovMode, CovOptions, CovOrdering, Covariance};
 use arael::simple_lm::{
     LmConfig, LmProblem, LmSession, LmStatus, RootProblem, SparseFaer,
     SparseFaerOptions,
@@ -28,6 +28,8 @@ pub struct GraphHandle {
 pub struct ResultDetail {
     result: arael::simple_lm::LmResult<f64>,
     buf: CString,
+    // Whether graph_result_covariance already moved the assembly out.
+    cov_taken: bool,
 }
 
 macro_rules! c_vec2 {
@@ -180,7 +182,7 @@ impl Default for CSolveFailure {
 }
 
 fn failure_of(k: &arael::simple_lm::SolveFailureKind) -> CSolveFailure {
-    use arael::simple_lm::{DiagonalFault as D, SolveError as E,
+    use arael::simple_lm::{DiagonalFault as D, SetupError as E,
                           SolveFailureKind as K};
     let mut c = CSolveFailure::default();
     match k {
@@ -350,6 +352,64 @@ pub struct CLmConfig {
     pub time_limit_seconds: COptSeconds,
     pub observer: Option<CObserverFn>,
     pub observer_user: *mut core::ffi::c_void,
+    pub assembly_threads: COptU32,
+    pub max_accepted_iters: COptU32,
+    /// Assemble the parameter covariance at the solution and carry it
+    /// in the result (graph_result_covariance): `has` asks, `v` is
+    /// the CovMode tag (0 PerQuery, 1 AllMarginals, 2 TriDiagonal).
+    pub covariance: COptU32,
+    /// How that covariance is assembled: the CovOrdering tag (0 Auto,
+    /// 1 Amd, 2 NestedDissection, 3 Natural).
+    pub covariance_ordering: u32,
+    /// The BlockSupernodalMode tag (0 Auto, 1 Always, 2 Never).
+    pub covariance_block_supernodal: u32,
+}
+
+fn cov_mode_of(tag: u32) -> CovMode {
+    match tag {
+        0 => CovMode::PerQuery,
+        2 => CovMode::TriDiagonal,
+        _ => CovMode::AllMarginals,
+    }
+}
+
+fn cov_mode_tag(m: CovMode) -> u32 {
+    match m {
+        CovMode::PerQuery => 0,
+        CovMode::AllMarginals => 1,
+        CovMode::TriDiagonal => 2,
+    }
+}
+
+fn cov_options_of(ordering: u32, block_supernodal: u32) -> CovOptions {
+    CovOptions {
+        ordering: match ordering {
+            1 => CovOrdering::Amd,
+            2 => CovOrdering::NestedDissection,
+            3 => CovOrdering::Natural,
+            _ => CovOrdering::Auto,
+        },
+        block_supernodal: match block_supernodal {
+            1 => arael::simple_lm::BlockSupernodalMode::Always,
+            2 => arael::simple_lm::BlockSupernodalMode::Never,
+            _ => arael::simple_lm::BlockSupernodalMode::Auto,
+        },
+    }
+}
+
+fn cov_options_tags(o: &CovOptions) -> (u32, u32) {
+    let ordering = match o.ordering {
+        CovOrdering::Auto => 0,
+        CovOrdering::Amd => 1,
+        CovOrdering::NestedDissection => 2,
+        CovOrdering::Natural => 3,
+    };
+    let block_supernodal = match o.block_supernodal {
+        arael::simple_lm::BlockSupernodalMode::Auto => 0,
+        arael::simple_lm::BlockSupernodalMode::Always => 1,
+        arael::simple_lm::BlockSupernodalMode::Never => 2,
+    };
+    (ordering, block_supernodal)
 }
 
 /// The sparse backend's options as plain data: constructed by
@@ -404,7 +464,7 @@ impl CSparseOptions {
     /// message. Unreachable through the typed wrappers.
     fn to_options(&self) -> SparseFaerOptions {
         use arael::simple_lm::{
-            BlockSupernodalMode, EnvelopeMode, FaerOrdering, SchurPolicy,
+            BlockSupernodalMode, EnvelopeMode, SolveOrdering, SchurPolicy,
         };
         let policy = match self.schur {
             0 => SchurPolicy::Auto {
@@ -416,11 +476,11 @@ impl CSparseOptions {
             t => panic!("unknown schur policy tag {t}"),
         };
         let ordering = match self.ordering {
-            0 => FaerOrdering::Auto,
-            1 => FaerOrdering::Amd,
-            2 => FaerOrdering::MarginalizeFirst,
-            3 => FaerOrdering::Natural,
-            4 => FaerOrdering::NestedDissection,
+            0 => SolveOrdering::Auto,
+            1 => SolveOrdering::Amd,
+            2 => SolveOrdering::MarginalizeFirst,
+            3 => SolveOrdering::Natural,
+            4 => SolveOrdering::NestedDissection,
             t => panic!("unknown ordering tag {t}"),
         };
         let envelope = match self.envelope {
@@ -442,12 +502,12 @@ impl CSparseOptions {
             .with_ordering(ordering)
             .with_envelope_schur(envelope)
             .with_envelope_panel_width((width > 0).then_some(width as usize))
-            .with_supernodal(self.supernodal)
+            .with_scalar_supernodal(self.supernodal)
             .with_narrow_band(self.narrow_band)
             .with_block_supernodal(block_supernodal)
             .with_block_supernodal_batching((batch > 0.0).then_some(batch))
             .with_block_supernodal_memory_lean(self.block_supernodal_memory_lean);
-        let cg = arael::simple_lm::CgOptions {
+        let cg = arael::simple_lm::CgParams {
             tol: self.cg_tol,
             max_iters: self.cg_max_iters as usize,
             restart_every: self.cg_restart_every as usize,
@@ -465,7 +525,7 @@ impl CSparseOptions {
 #[no_mangle]
 pub unsafe extern "C" fn graph_sparse_options(out: *mut CSparseOptions) {
     use arael::simple_lm::{
-        BlockSupernodalMode, EnvelopeMode, FaerOrdering, SchurPolicy,
+        BlockSupernodalMode, EnvelopeMode, SolveOrdering, SchurPolicy,
     };
     let d = SparseFaerOptions::default();
     let (flop_margin, obvious_flop_ratio) = match d.policy {
@@ -481,11 +541,11 @@ pub unsafe extern "C" fn graph_sparse_options(out: *mut CSparseOptions) {
             SchurPolicy::Never => 2,
         },
         ordering: match d.ordering {
-            FaerOrdering::Auto => 0,
-            FaerOrdering::Amd => 1,
-            FaerOrdering::MarginalizeFirst => 2,
-            FaerOrdering::Natural => 3,
-            FaerOrdering::NestedDissection => 4,
+            SolveOrdering::Auto => 0,
+            SolveOrdering::Amd => 1,
+            SolveOrdering::MarginalizeFirst => 2,
+            SolveOrdering::Natural => 3,
+            SolveOrdering::NestedDissection => 4,
         },
         envelope: match d.envelope {
             EnvelopeMode::Auto => 0,
@@ -493,11 +553,11 @@ pub unsafe extern "C" fn graph_sparse_options(out: *mut CSparseOptions) {
             EnvelopeMode::Never => 2,
         },
         envelope_panel_width: d.envelope_panel_width.unwrap_or(0) as u32,
-        supernodal: d.supernodal,
+        supernodal: d.scalar_supernodal,
         narrow_band: d.narrow_band,
         flop_margin,
         obvious_flop_ratio,
-        cg_tol: arael::simple_lm::CgOptions::default().tol,
+        cg_tol: arael::simple_lm::CgParams::default().tol,
         schur_solve: 0,
         cg_max_iters: 0,
         cg_restart_every: 0,
@@ -548,6 +608,20 @@ pub unsafe extern "C" fn graph_lm_config(preset: u32, out: *mut CLmConfig) {
         },
         observer: None,
         observer_user: std::ptr::null_mut(),
+        assembly_threads: match c.assembly_threads {
+            Some(n) => COptU32 { has: true, v: n as u32 },
+            None => COptU32 { has: false, v: 0 },
+        },
+        max_accepted_iters: match c.max_accepted_iters {
+            Some(n) => COptU32 { has: true, v: n as u32 },
+            None => COptU32 { has: false, v: 0 },
+        },
+        covariance: match c.covariance {
+            Some(m) => COptU32 { has: true, v: cov_mode_tag(m) },
+            None => COptU32 { has: false, v: 0 },
+        },
+        covariance_ordering: cov_options_tags(&c.covariance_options).0,
+        covariance_block_supernodal: cov_options_tags(&c.covariance_options).1,
     };
 }
 
@@ -558,6 +632,8 @@ impl CLmConfig {
         c.min_iters = self.min_iters as usize;
         c.patience = self.patience as usize;
         c.num_threads = self.num_threads as usize;
+        c.assembly_threads = self.assembly_threads.has.then(|| self.assembly_threads.v as usize);
+        c.max_accepted_iters = self.max_accepted_iters.has.then(|| self.max_accepted_iters.v as usize);
         c.verbose = self.verbose;
         c.gather_timing = self.gather_timing;
         c.abs_precision = self.abs_precision;
@@ -572,6 +648,8 @@ impl CLmConfig {
         c.time_limit = self.time_limit_seconds.has.then(|| {
             std::time::Duration::from_secs_f64(self.time_limit_seconds.v)
         });
+        c.covariance = self.covariance.has.then(|| cov_mode_of(self.covariance.v));
+        c.covariance_options = cov_options_of(self.covariance_ordering, self.covariance_block_supernodal);
         if let Some(f) = self.observer {
             c = c.with_observer(CObserver { f, user: self.observer_user });
         }
@@ -599,6 +677,9 @@ pub struct CLmTiming {
     pub linear_solve_count: u32,
     pub cost_eval_count: u32,
     pub advance_count: u32,
+    /// The covariance assembly the config asked for, after the solve
+    /// and outside `total`; zero when none was asked.
+    pub covariance: f64,
 }
 
 /// LmStep mirror: one attempted step of the per-attempt timeline
@@ -676,6 +757,105 @@ pub struct CRouteFlops {
 pub struct COptRouteFlops {
     pub has: bool,
     pub v: CRouteFlops,
+}
+
+/// One form's share of a sweep phase, summed over its calls (mirrors
+/// arael's FormTiming). Seconds.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CFormTiming {
+    pub calls: u32,
+    pub region: f64,
+    pub task_sum: f64,
+    pub task_max: f64,
+    pub task_min: f64,
+}
+
+/// A sweep phase's clocks: the dispatched calls and the ones run on the
+/// calling thread (mirrors arael's PhaseTiming).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CPhaseTiming {
+    pub par: CFormTiming,
+    pub seq: CFormTiming,
+}
+
+/// Where the sweeps' time went (mirrors arael's ParTiming); all zero
+/// unless the solve gathered timing, and `on` says which.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CParTiming {
+    pub on: bool,
+    pub bind: f64,
+    pub assembly_update: f64,
+    pub assembly_zero: f64,
+    pub assembly: CPhaseTiming,
+    pub gather_grad: f64,
+    pub assembly_zero_vals: f64,
+    pub scatter: f64,
+    pub cost_update: f64,
+    pub cost: CPhaseTiming,
+}
+
+/// What one store holds (mirrors arael's StoreFootprint).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CStoreFootprint {
+    pub self_blocks: u64,
+    pub cross_blocks: u64,
+    pub coo_entries: u64,
+    pub bytes: u64,
+}
+
+/// What one phase's sweeps did over a solve (mirrors arael's
+/// PhaseChoice).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CPhaseChoice {
+    pub threaded: bool,
+    pub calls: u32,
+}
+
+/// What the sweeps did (mirrors arael's SweepReport). `held` is the
+/// store count; graph_result_threads_held reads the footprints.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CSweepReport {
+    pub threads: u32,
+    pub assembly: CPhaseChoice,
+    pub cost: CPhaseChoice,
+    pub timing: CParTiming,
+    pub whole: CStoreFootprint,
+    pub held: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct COptSweepReport {
+    pub has: bool,
+    pub v: CSweepReport,
+}
+
+/// What a solve's threads did (mirrors arael's ThreadReport). `sweeps`
+/// is absent when the model has no threaded sweep path.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CThreadReport {
+    pub sweeps_asked: u32,
+    pub linear: u32,
+    pub fell_back: bool,
+    pub sweeps: COptSweepReport,
+}
+
+/// The arael version the shim was built with (mirrors arael's Version):
+/// the three numbers and the tag after the dash, a static C string,
+/// empty for a release.
+#[repr(C)]
+pub struct CAraelVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    pub pre: *const c_char,
 }
 
 #[repr(C)]
@@ -759,7 +939,7 @@ unsafe fn fill_plan(out: *mut CSchurPlan, p: &arael::simple_lm::SchurPlan) {
                     ReducedOrdering::NaturalBanded => 0,
                     ReducedOrdering::NaturalDense => 1,
                     ReducedOrdering::Amd => 2,
-                    ReducedOrdering::Nd => 3,
+                    ReducedOrdering::NestedDissection => 3,
                 },
             },
             None => COptI32 { has: false, v: 0 },
@@ -798,6 +978,7 @@ unsafe fn fill_result(out: *mut CLmResult, r: &arael::simple_lm::LmResult<f64>) 
             linear_solve_count: t.linear_solve_count as u32,
             cost_eval_count: t.cost_eval_count as u32,
             advance_count: t.advance_count as u32,
+            covariance: t.covariance.as_secs_f64(),
         }, true),
         None => (CLmTiming::default(), false),
     };
@@ -816,7 +997,7 @@ unsafe fn fill_result(out: *mut CLmResult, r: &arael::simple_lm::LmResult<f64>) 
 }
 
 fn boxed(r: arael::simple_lm::LmResult<f64>) -> *mut ResultDetail {
-    Box::into_raw(Box::new(ResultDetail { result: r, buf: CString::default() }))
+    Box::into_raw(Box::new(ResultDetail { result: r, buf: CString::default(), cov_taken: false }))
 }
 
 #[no_mangle]
@@ -865,6 +1046,124 @@ pub unsafe extern "C" fn graph_result_plan(d: *const ResultDetail, out: *mut CSc
         }
         _ => false,
     }
+}
+
+fn c_form(f: &arael::threads::FormTiming) -> CFormTiming {
+    CFormTiming {
+        calls: f.calls as u32,
+        region: f.region.as_secs_f64(),
+        task_sum: f.task_sum.as_secs_f64(),
+        task_max: f.task_max.as_secs_f64(),
+        task_min: f.task_min.as_secs_f64(),
+    }
+}
+
+fn c_phase(p: &arael::threads::PhaseTiming) -> CPhaseTiming {
+    CPhaseTiming { par: c_form(&p.par), seq: c_form(&p.seq) }
+}
+
+fn c_footprint(s: &arael::threads::StoreFootprint) -> CStoreFootprint {
+    CStoreFootprint {
+        self_blocks: s.self_blocks as u64,
+        cross_blocks: s.cross_blocks as u64,
+        coo_entries: s.coo_entries as u64,
+        bytes: s.bytes as u64,
+    }
+}
+
+fn c_choice(c: &arael::threads::PhaseChoice) -> CPhaseChoice {
+    CPhaseChoice { threaded: c.threaded, calls: c.calls as u32 }
+}
+
+/// What the solve's threads did, for the result behind `d`.
+#[no_mangle]
+pub unsafe extern "C" fn graph_result_threads(d: *const ResultDetail, out: *mut CThreadReport) {
+    let t = &(*d).result.threads;
+    let sweeps = match &t.sweeps {
+        Some(s) => {
+            let g = &s.timing;
+            COptSweepReport {
+                has: true,
+                v: CSweepReport {
+                    threads: s.threads as u32,
+                    assembly: c_choice(&s.assembly),
+                    cost: c_choice(&s.cost),
+                    timing: CParTiming {
+                        on: g.on,
+                        bind: g.bind.as_secs_f64(),
+                        assembly_update: g.assembly_update.as_secs_f64(),
+                        assembly_zero: g.assembly_zero.as_secs_f64(),
+                        assembly: c_phase(&g.assembly),
+                        gather_grad: g.gather_grad.as_secs_f64(),
+                        assembly_zero_vals: g.assembly_zero_vals.as_secs_f64(),
+                        scatter: g.scatter.as_secs_f64(),
+                        cost_update: g.cost_update.as_secs_f64(),
+                        cost: c_phase(&g.cost),
+                    },
+                    whole: c_footprint(&s.whole),
+                    held: s.held.len() as u32,
+                },
+            }
+        }
+        None => COptSweepReport::default(),
+    };
+    *out = CThreadReport {
+        sweeps_asked: t.sweeps_asked as u32,
+        linear: t.linear as u32,
+        fell_back: t.fell_back(),
+        sweeps,
+    };
+}
+
+/// What each split store of the result behind `d` holds
+/// (SweepReport::held). Copies up to `cap` records into `out` and
+/// returns the total count -- call with cap 0 to size the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn graph_result_threads_held(d: *const ResultDetail, out: *mut CStoreFootprint, cap: u64) -> u64 {
+    let held: &[arael::threads::StoreFootprint] = match &(*d).result.threads.sweeps {
+        Some(s) => &s.held,
+        None => &[],
+    };
+    for (i, s) in held.iter().take(cap as usize).enumerate() {
+        *out.add(i) = c_footprint(s);
+    }
+    held.len() as u64
+}
+
+/// The covariance the config asked for (CLmConfig::covariance),
+/// assembled at the solution by the solve behind `d`. Moves it out of
+/// the result: returns 0 and the owned handle in `out` (release with
+/// graph_cov_free), 1 with `out` null when the config did not
+/// ask, 2 when an earlier call already took it, -1 when the assembly
+/// failed (text via graph_result_error).
+#[no_mangle]
+pub unsafe extern "C" fn graph_result_covariance(d: *mut ResultDetail, out: *mut *mut GraphCov) -> i32 {
+    *out = std::ptr::null_mut();
+    let dd = &mut *d;
+    if dd.cov_taken {
+        return 2;
+    }
+    match std::mem::replace(&mut dd.result.covariance, Err(CovError::NotRequested)) {
+        Ok(c) => {
+            dd.cov_taken = true;
+            *out = Box::into_raw(Box::new(GraphCov { cov: c, text: CString::default() }));
+            0
+        }
+        Err(CovError::NotRequested) => 1,
+        Err(e) => {
+            dd.result.covariance = Err(e);
+            dd.buf = CString::new(format!("{}", e).replace('\0', " ")).unwrap_or_default();
+            -1
+        }
+    }
+}
+
+/// The text of the last failure reported by a call on the result
+/// behind `d` (graph_result_covariance). Valid until the next
+/// call on the same result or graph_result_free.
+#[no_mangle]
+pub unsafe extern "C" fn graph_result_error(d: *const ResultDetail) -> *const c_char {
+    (*d).buf.as_ptr()
 }
 
 /// Per-attempt timeline of the result behind `d` (LmTiming::steps;
@@ -918,6 +1217,27 @@ pub extern "C" fn graph_set_log_level(level: u32) {
         2 => arael::log::Level::Warn,
         _ => arael::log::Level::Info,
     });
+}
+
+/// Stop and join arael's sweep worker threads; the next threaded solve
+/// spawns them again. Process-wide. Without the `threads` feature no
+/// worker is ever spawned and it returns at once.
+#[no_mangle]
+pub extern "C" fn graph_pool_shutdown() {
+    arael::pool::shutdown();
+}
+
+/// The arael version the shim was built with; `pre` points at a static
+/// C string.
+#[no_mangle]
+pub unsafe extern "C" fn graph_arael_version(out: *mut CAraelVersion) {
+    static PRE: std::sync::OnceLock<CString> = std::sync::OnceLock::new();
+    *out = CAraelVersion {
+        major: arael::VERSION.major,
+        minor: arael::VERSION.minor,
+        patch: arael::VERSION.patch,
+        pre: PRE.get_or_init(|| CString::new(arael::VERSION.pre).unwrap()).as_ptr(),
+    };
 }
 
 /// Empty string when the model is clean, the Diagnostic text otherwise.
@@ -1028,10 +1348,11 @@ pub unsafe extern "C" fn graph_solve_sparse(
 /// A warm-reuse session over the sparse backend (Rust's LmSession):
 /// keeps the analysis -- pattern, ordering, symbolic factorization,
 /// Schur plan -- across solves, so only the first pays for it. Warm
-/// solves are bit-identical to cold ones. A parameter-count change
-/// re-analyzes by itself; graph_session_invalidate covers a
-/// structural change at the same count (solving warm through one is
-/// undefined).
+/// solves are bit-identical to cold ones. Call
+/// graph_session_invalidate after any structural change: a
+/// changed parameter or block count without it fails the solve, and a
+/// change that keeps every count solves warm through stale analysis
+/// (undefined).
 pub struct GraphSession {
     // Err carries a construction panic (a bad options tag), reported
     // by the first solve.
@@ -1138,12 +1459,7 @@ pub unsafe extern "C" fn graph_solve_band(
     let c = (*cfg).to_config();
     zero_result(out);
     match catch_unwind(AssertUnwindSafe(|| {
-        let mut x0 = Vec::new();
-        hh.model.serialize(&mut x0);
-        arael::simple_lm::solve_band(&x0, kd as usize, &mut hh.model, &c).map(|r| {
-            hh.model.deserialize(&r.x);
-            r
-        })
+        hh.model.solve_with(&mut arael::simple_lm::Band::new(kd as usize), &c)
     })) {
         Ok(Ok(r)) => {
             let code = fill_result(out, &r);
@@ -1264,27 +1580,45 @@ pub unsafe extern "C" fn graph_assemble_covariance_with(
     h: *mut GraphHandle, mode: u32, ordering: u32, block_supernodal: u32,
     out: *mut *mut GraphCov,
 ) -> i32 {
+    let mut ctx = arael::threads::Context::new();
+    graph_cov_build(&mut *h, mode, ordering, block_supernodal, &mut ctx, out)
+}
+
+/// graph_assemble_covariance reusing what the session's solves
+/// built. Error text lands on the model handle.
+#[no_mangle]
+pub unsafe extern "C" fn graph_session_assemble_covariance(
+    s: *mut GraphSession, h: *mut GraphHandle, mode: u32, out: *mut *mut GraphCov,
+) -> i32 {
+    graph_session_assemble_covariance_with(s, h, mode, 0, 0, out)
+}
+
+/// graph_session_assemble_covariance with the assembly spelled out.
+#[no_mangle]
+pub unsafe extern "C" fn graph_session_assemble_covariance_with(
+    s: *mut GraphSession, h: *mut GraphHandle, mode: u32, ordering: u32, block_supernodal: u32,
+    out: *mut *mut GraphCov,
+) -> i32 {
     let hh = &mut *h;
     *out = std::ptr::null_mut();
-    let m = match mode {
-        0 => CovMode::PerQuery,
-        2 => CovMode::TriDiagonal,
-        _ => CovMode::AllMarginals,
-    };
-    let opts = CovOptions {
-        ordering: match ordering {
-            1 => CovOrdering::Amd,
-            2 => CovOrdering::NestedDissection,
-            3 => CovOrdering::Natural,
-            _ => CovOrdering::Auto,
-        },
-        block_supernodal: match block_supernodal {
-            1 => arael::simple_lm::BlockSupernodalMode::Always,
-            2 => arael::simple_lm::BlockSupernodalMode::Never,
-            _ => arael::simple_lm::BlockSupernodalMode::Auto,
-        },
-    };
-    match catch_unwind(AssertUnwindSafe(|| hh.model.assemble_covariance_with(m, &opts))) {
+    match &mut (*s).session {
+        Ok(sess) => graph_cov_build(hh, mode, ordering, block_supernodal, sess.context_mut(), out),
+        Err(msg) => {
+            let msg = msg.clone();
+            set_text(hh, &msg);
+            -2
+        }
+    }
+}
+
+unsafe fn graph_cov_build(
+    hh: &mut GraphHandle, mode: u32, ordering: u32, block_supernodal: u32,
+    ctx: &mut arael::threads::Context, out: *mut *mut GraphCov,
+) -> i32 {
+    *out = std::ptr::null_mut();
+    let m = cov_mode_of(mode);
+    let opts = cov_options_of(ordering, block_supernodal);
+    match catch_unwind(AssertUnwindSafe(|| hh.model.assemble_covariance_with(m, &opts, ctx))) {
         Ok(Ok(c)) => {
             *out = Box::into_raw(Box::new(GraphCov {
                 cov: c,
@@ -1518,6 +1852,168 @@ pub unsafe extern "C" fn graph_poses_try_get(p: *mut GraphHandle, r: u32) -> *mu
         None => std::ptr::null_mut(),
     }
 }
+/// Appends `n` elements built from `n` slot records of 6 u64 each (mask
+/// word(s), then one slot per leaf), or `n` defaults when `slots` is null.
+/// Returns the first new element's key: its packed ref on a refs::Vec,
+/// its index on a std::vec::Vec.
+#[no_mangle]
+pub unsafe extern "C" fn graph_poses_push_n(p: *mut GraphHandle, slots: *const u64, n: u32) -> u32 {
+    let m = &mut (*p).model.poses;
+    let first = m.len();
+    m.reserve(n as usize);
+    for i in 0..n as usize {
+        let mut e: Pose2 = Default::default();
+        if !slots.is_null() {
+            assign_slots_pose2(&mut e, slots.add(i * 6));
+        }
+        m.push(e);
+    }
+    if n == 0 { u32::MAX } else { m.ref_at(first).to_raw() }
+}
+/// Sets `pos` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_poses_set_pos_n(
+    p: *mut GraphHandle, start: u32, v: *const f64, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.poses;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const f64;
+        m[start + i].pos.value = std::mem::transmute::<[f64; 2], CVec2F64>(std::ptr::read_unaligned(src as *const [f64; 2])).into();
+    }
+    true
+}
+/// Reads `pos` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_poses_get_pos_n(
+    p: *const GraphHandle, start: u32, out: *mut f64, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.poses;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut f64;
+        let mv: CVec2F64 = m[start + i].pos.value.into();
+        std::ptr::write_unaligned(dst as *mut [f64; 2], std::mem::transmute::<CVec2F64, [f64; 2]>(mv));
+    }
+    true
+}
+/// Sets `pos_optimize` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_poses_set_pos_optimize_n(
+    p: *mut GraphHandle, start: u32, v: *const u8, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.poses;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const u8;
+        m[start + i].pos.optimize = std::ptr::read_unaligned(src) != 0;
+    }
+    true
+}
+/// Reads `pos_optimize` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_poses_get_pos_optimize_n(
+    p: *const GraphHandle, start: u32, out: *mut u8, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.poses;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut u8;
+        std::ptr::write_unaligned(dst, m[start + i].pos.optimize as u8);
+    }
+    true
+}
+/// Sets `rot_angle` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_poses_set_rot_angle_n(
+    p: *mut GraphHandle, start: u32, v: *const f64, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.poses;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const f64;
+        m[start + i].rot.angle.value = std::ptr::read_unaligned(src);
+    }
+    true
+}
+/// Reads `rot_angle` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_poses_get_rot_angle_n(
+    p: *const GraphHandle, start: u32, out: *mut f64, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.poses;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut f64;
+        std::ptr::write_unaligned(dst, m[start + i].rot.angle.value);
+    }
+    true
+}
+/// Sets `rot_angle_optimize` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_poses_set_rot_angle_optimize_n(
+    p: *mut GraphHandle, start: u32, v: *const u8, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.poses;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const u8;
+        m[start + i].rot.angle.optimize = std::ptr::read_unaligned(src) != 0;
+    }
+    true
+}
+/// Reads `rot_angle_optimize` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_poses_get_rot_angle_optimize_n(
+    p: *const GraphHandle, start: u32, out: *mut u8, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.poses;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut u8;
+        std::ptr::write_unaligned(dst, m[start + i].rot.angle.optimize as u8);
+    }
+    true
+}
+/// Packed refs of elements `start..start + n`, in index order; false when
+/// the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_poses_get_refs_n(
+    p: *const GraphHandle, start: u32, out: *mut u32, n: u32) -> bool {
+    let m = &(*p).model.poses;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        *out.add(i) = m.ref_at(start + i).to_raw();
+    }
+    true
+}
 #[no_mangle]
 pub unsafe extern "C" fn graph_edges_len(p: *const GraphHandle) -> u32 {
     (*p).model.edges.len() as u32
@@ -1549,6 +2045,376 @@ pub unsafe extern "C" fn graph_edges_clear(p: *mut GraphHandle) {
 #[no_mangle]
 pub unsafe extern "C" fn graph_edges_truncate(p: *mut GraphHandle, len: u32) {
     (*p).model.edges.truncate(len as usize);
+}
+/// Appends `n` elements built from `n` slot records of 12 u64 each (mask
+/// word(s), then one slot per leaf), or `n` defaults when `slots` is null.
+/// Returns the first new element's key: its packed ref on a refs::Vec,
+/// its index on a std::vec::Vec.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_push_n(p: *mut GraphHandle, slots: *const u64, n: u32) -> u32 {
+    let m = &mut (*p).model.edges;
+    let first = m.len();
+    m.reserve(n as usize);
+    for i in 0..n as usize {
+        let mut e: Edge = Default::default();
+        if !slots.is_null() {
+            assign_slots_edge(&mut e, slots.add(i * 12));
+        }
+        m.push(e);
+    }
+    first as u32
+}
+/// Sets `a` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_set_a_n(
+    p: *mut GraphHandle, start: u32, v: *const u32, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const u32;
+        m[start + i].a = arael::refs::Ref::from_raw(std::ptr::read_unaligned(src));
+    }
+    true
+}
+/// Reads `a` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_get_a_n(
+    p: *const GraphHandle, start: u32, out: *mut u32, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut u32;
+        std::ptr::write_unaligned(dst, m[start + i].a.to_raw());
+    }
+    true
+}
+/// Sets `b` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_set_b_n(
+    p: *mut GraphHandle, start: u32, v: *const u32, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const u32;
+        m[start + i].b = arael::refs::Ref::from_raw(std::ptr::read_unaligned(src));
+    }
+    true
+}
+/// Reads `b` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_get_b_n(
+    p: *const GraphHandle, start: u32, out: *mut u32, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut u32;
+        std::ptr::write_unaligned(dst, m[start + i].b.to_raw());
+    }
+    true
+}
+/// Sets `dx` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_set_dx_n(
+    p: *mut GraphHandle, start: u32, v: *const f64, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const f64;
+        m[start + i].dx = std::ptr::read_unaligned(src);
+    }
+    true
+}
+/// Reads `dx` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_get_dx_n(
+    p: *const GraphHandle, start: u32, out: *mut f64, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut f64;
+        std::ptr::write_unaligned(dst, m[start + i].dx);
+    }
+    true
+}
+/// Sets `dy` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_set_dy_n(
+    p: *mut GraphHandle, start: u32, v: *const f64, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const f64;
+        m[start + i].dy = std::ptr::read_unaligned(src);
+    }
+    true
+}
+/// Reads `dy` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_get_dy_n(
+    p: *const GraphHandle, start: u32, out: *mut f64, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut f64;
+        std::ptr::write_unaligned(dst, m[start + i].dy);
+    }
+    true
+}
+/// Sets `dth` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_set_dth_n(
+    p: *mut GraphHandle, start: u32, v: *const f64, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const f64;
+        m[start + i].dth = std::ptr::read_unaligned(src);
+    }
+    true
+}
+/// Reads `dth` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_get_dth_n(
+    p: *const GraphHandle, start: u32, out: *mut f64, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut f64;
+        std::ptr::write_unaligned(dst, m[start + i].dth);
+    }
+    true
+}
+/// Sets `s00` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_set_s00_n(
+    p: *mut GraphHandle, start: u32, v: *const f64, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const f64;
+        m[start + i].s00 = std::ptr::read_unaligned(src);
+    }
+    true
+}
+/// Reads `s00` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_get_s00_n(
+    p: *const GraphHandle, start: u32, out: *mut f64, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut f64;
+        std::ptr::write_unaligned(dst, m[start + i].s00);
+    }
+    true
+}
+/// Sets `s01` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_set_s01_n(
+    p: *mut GraphHandle, start: u32, v: *const f64, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const f64;
+        m[start + i].s01 = std::ptr::read_unaligned(src);
+    }
+    true
+}
+/// Reads `s01` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_get_s01_n(
+    p: *const GraphHandle, start: u32, out: *mut f64, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut f64;
+        std::ptr::write_unaligned(dst, m[start + i].s01);
+    }
+    true
+}
+/// Sets `s02` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_set_s02_n(
+    p: *mut GraphHandle, start: u32, v: *const f64, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const f64;
+        m[start + i].s02 = std::ptr::read_unaligned(src);
+    }
+    true
+}
+/// Reads `s02` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_get_s02_n(
+    p: *const GraphHandle, start: u32, out: *mut f64, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut f64;
+        std::ptr::write_unaligned(dst, m[start + i].s02);
+    }
+    true
+}
+/// Sets `s11` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_set_s11_n(
+    p: *mut GraphHandle, start: u32, v: *const f64, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const f64;
+        m[start + i].s11 = std::ptr::read_unaligned(src);
+    }
+    true
+}
+/// Reads `s11` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_get_s11_n(
+    p: *const GraphHandle, start: u32, out: *mut f64, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut f64;
+        std::ptr::write_unaligned(dst, m[start + i].s11);
+    }
+    true
+}
+/// Sets `s12` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_set_s12_n(
+    p: *mut GraphHandle, start: u32, v: *const f64, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const f64;
+        m[start + i].s12 = std::ptr::read_unaligned(src);
+    }
+    true
+}
+/// Reads `s12` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_get_s12_n(
+    p: *const GraphHandle, start: u32, out: *mut f64, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut f64;
+        std::ptr::write_unaligned(dst, m[start + i].s12);
+    }
+    true
+}
+/// Sets `s22` on elements `start..start + n` from values `stride` bytes
+/// apart (0 broadcasts one value); false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_set_s22_n(
+    p: *mut GraphHandle, start: u32, v: *const f64, n: u32, stride: i64) -> bool {
+    let m = &mut (*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let src = (v as *const u8).offset((i as i64 * stride) as isize) as *const f64;
+        m[start + i].s22 = std::ptr::read_unaligned(src);
+    }
+    true
+}
+/// Reads `s22` of elements `start..start + n` into slots `stride` bytes
+/// apart; false when the range exceeds the collection.
+#[no_mangle]
+pub unsafe extern "C" fn graph_edges_get_s22_n(
+    p: *const GraphHandle, start: u32, out: *mut f64, n: u32, stride: i64) -> bool {
+    let m = &(*p).model.edges;
+    let (start, n) = (start as usize, n as usize);
+    if start + n > m.len() {
+        return false;
+    }
+    for i in 0..n {
+        let dst = (out as *mut u8).offset((i as i64 * stride) as isize) as *mut f64;
+        std::ptr::write_unaligned(dst, m[start + i].s22);
+    }
+    true
 }
 #[no_mangle]
 pub unsafe extern "C" fn graph_edge_a(p: *const Edge) -> u32 {
@@ -1673,4 +2539,61 @@ pub unsafe extern "C" fn graph_pose2_rot_angle_set_optimize(p: *mut Pose2, v: bo
 #[no_mangle]
 pub unsafe extern "C" fn graph_pose2_rot_rotation_matrix(p: *const Pose2) -> CMat2F64 {
     (*p).rot.rotation_matrix().into()
+}
+
+/// Assigns a slot record's masked leaves onto a `Edge`: 1 mask
+/// word(s), then 11 slot(s), one per leaf in field order.
+#[allow(dead_code)]
+unsafe fn assign_slots_edge(e: &mut Edge, s: *const u64) {
+    if *s.add(0) & (1u64 << 0) != 0 {
+        e.a = arael::refs::Ref::from_raw(*s.add(1) as u32);
+    }
+    if *s.add(0) & (1u64 << 1) != 0 {
+        e.b = arael::refs::Ref::from_raw(*s.add(2) as u32);
+    }
+    if *s.add(0) & (1u64 << 2) != 0 {
+        e.dx = f64::from_bits(*s.add(3));
+    }
+    if *s.add(0) & (1u64 << 3) != 0 {
+        e.dy = f64::from_bits(*s.add(4));
+    }
+    if *s.add(0) & (1u64 << 4) != 0 {
+        e.dth = f64::from_bits(*s.add(5));
+    }
+    if *s.add(0) & (1u64 << 5) != 0 {
+        e.s00 = f64::from_bits(*s.add(6));
+    }
+    if *s.add(0) & (1u64 << 6) != 0 {
+        e.s01 = f64::from_bits(*s.add(7));
+    }
+    if *s.add(0) & (1u64 << 7) != 0 {
+        e.s02 = f64::from_bits(*s.add(8));
+    }
+    if *s.add(0) & (1u64 << 8) != 0 {
+        e.s11 = f64::from_bits(*s.add(9));
+    }
+    if *s.add(0) & (1u64 << 9) != 0 {
+        e.s12 = f64::from_bits(*s.add(10));
+    }
+    if *s.add(0) & (1u64 << 10) != 0 {
+        e.s22 = f64::from_bits(*s.add(11));
+    }
+}
+
+/// Assigns a slot record's masked leaves onto a `Pose2`: 1 mask
+/// word(s), then 5 slot(s), one per leaf in field order.
+#[allow(dead_code)]
+unsafe fn assign_slots_pose2(e: &mut Pose2, s: *const u64) {
+    if *s.add(0) & (1u64 << 0) != 0 {
+        e.pos.value = std::mem::transmute::<[f64; 2], CVec2F64>([f64::from_bits(*s.add(1)), f64::from_bits(*s.add(2))]).into();
+    }
+    if *s.add(0) & (1u64 << 1) != 0 {
+        e.pos.optimize = *s.add(3) != 0;
+    }
+    if *s.add(0) & (1u64 << 2) != 0 {
+        e.rot.angle.value = f64::from_bits(*s.add(4));
+    }
+    if *s.add(0) & (1u64 << 3) != 0 {
+        e.rot.angle.optimize = *s.add(5) != 0;
+    }
 }

@@ -1,0 +1,5 @@
+# cargo arael export also emits python and wasm bindings and sidecar
+# metadata; only capi/ and cxx/ are used by the plugin
+/python/
+/wasm/
+/target/

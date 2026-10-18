@@ -26,28 +26,83 @@ any ScanSolver plugin on 2D pose-graph datasets in g2o format.
 
 ## Benchmark
 
-`solver_benchmark <file.g2o> --reps 3`, batch solve, median of 3 runs
-on one machine. Both plugins receive the identical graph; cost is
-0.5 * sum of squared sqrt-information-weighted residuals. The Ceres
-plugin runs on 8 threads, arael on one. Each run is a forked child;
-maxrss is its peak memory. Datasets from the
-[SE-Sync](https://github.com/david-m-rosen/SE-Sync) collection plus
-M3500.
+`test/solver_benchmark` on an AMD Ryzen 9 7950X3D, in a ros:lyrical
+container (Ubuntu 26.04). Both plugins receive the identical graph through
+the ScanSolver interface and minimize the identical objective; the cost
+is 0.5 * sum of squared sqrt-information-weighted residuals, as the
+plugins compute it. Both run as slam_toolbox ships them: the Ceres plugin
+on its configured 50 threads, arael on one, unpinned. Each stops by its
+own rule (Ceres at a relative cost decrease of 1e-3 or 50 iterations,
+arael's well-conditioned preset), so the final cost stands next to the
+time: a plugin that stops early ends higher. Each run is a forked process;
+3 rounds, median. Datasets: M3500 and the 2D files of the
+[SE-Sync](https://github.com/david-m-rosen/SE-Sync) collection; files
+without vertex poses start from the odometry chain, as karto builds it.
 
-| dataset | nodes / edges | Ceres ms / iters | arael ms / iters | final cost Ceres / arael | maxrss MB Ceres / arael |
-|---|---|---|---|---|---|
-| M3500 | 3500 / 5453 | 85.3 / 10 | 15.3 / 5 | 68.98 / 68.96 | 74.7 / 50.5 |
-| ais2klinik | 15115 / 16727 | 362.6 / 22 | 60.4 / 11 | 87.39 / 86.48 | 123.3 / 81.3 |
-| city10000 | 10000 / 20687 | 318.0 / 6 | 84.4 / 7 | 256.28 / 255.99 | 122.2 / 80.0 |
-| CSAIL [1] | 1045 / 1172 | 11.8 / 8 | 2.7 / 5 | 30.48 / 30.38 | 60.5 / 42.3 |
-| intel | 1728 / 2512 | 13.4 / 4 | 4.0 / 3 | 22.215 / 22.209 | 63.6 / 43.6 |
-| kitti_00 | 4541 / 4679 | 60.0 / 13 | 7.9 / 4 | 49.152 / 49.152 | 76.2 / 50.6 |
-| kitti_02 | 4661 / 4704 | 92.6 / 22 | 9.0 / 5 | 39.61 / 39.40 | 76.2 / 50.7 |
-| kitti_05 | 2761 / 2827 | 31.4 / 10 | 4.4 / 3 | 78.547 / 78.542 | 68.5 / 45.9 |
-| manhattan | 3500 / 5453 | 230.7 / 28 | 19.4 / 7 | 1783.3 / 1766.7 | 74.8 / 50.4 |
-| MIT | 808 / 827 | 42.6 / 50 [2] | 3.4 / 15 | 2437.2 / 384.9 | 59.4 / 40.5 |
+```
+solver_benchmark data/intel.g2o --reps 5 --warmup 1 --every 100
+```
 
-[1] Solver-internal costs: CSAIL's near-singular information matrices
-make the raw-file reference cost unstable through the interface's
-covariance round trip (affects both plugins equally).
-[2] Unconverged: hit Ceres' default 50-iteration cap.
+### Batch
+
+The whole graph solved from its initial guess, 5 runs a round, each after
+an untimed warm-up solve of the same graph. Peak memory is from a run
+without the warm-up. "(cap)" marks a solve that stopped at its plugin's
+iteration cap.
+
+| dataset | nodes / edges | backend | time ms | iterations | final cost | peak memory MB |
+|---|---|---|---|---|---|---|
+| M3500 | 3,500 / 5,453 | arael | 14.5 | 5 | 68.9565 | 45 |
+| M3500 | 3,500 / 5,453 | Ceres | 103.7 | 10 | 68.9845 | 57 |
+| ais2klinik | 15,115 / 16,727 | arael | 65.2 | 11 | 86.4837 | 76 |
+| ais2klinik | 15,115 / 16,727 | Ceres | 523.0 | 22 | 87.3851 | 113 |
+| city10000 | 10,000 / 20,687 | arael | 81.0 | 7 | 255.9926 | 76 |
+| city10000 | 10,000 / 20,687 | Ceres | 291.5 | 6 | 256.2761 | 112 |
+| CSAIL [1] | 1,045 / 1,172 | arael | 2.60 | 5 | 30.3837 | 36 |
+| CSAIL [1] | 1,045 / 1,172 | Ceres | 13.8 | 8 | 30.4806 | 41 |
+| intel | 1,728 / 2,512 | arael | 4.20 | 3 | 22.2089 | 39 |
+| intel | 1,728 / 2,512 | Ceres | 18.0 | 4 | 22.2151 | 46 |
+| kitti_00 | 4,541 / 4,679 | arael | 9.40 | 4 | 49.1237 | 46 |
+| kitti_00 | 4,541 / 4,679 | Ceres | 85.0 | 13 | 49.1520 | 58 |
+| kitti_02 | 4,661 / 4,704 | arael | 10.3 | 5 | 39.4042 | 45 |
+| kitti_02 | 4,661 / 4,704 | Ceres | 134.0 | 22 | 39.6120 | 59 |
+| kitti_05 | 2,761 / 2,827 | arael | 4.70 | 3 | 78.5419 | 41 |
+| kitti_05 | 2,761 / 2,827 | Ceres | 41.8 | 10 | 78.5470 | 49 |
+| manhattan | 3,500 / 5,453 | arael | 18.8 | 7 | 1766.7 | 46 |
+| manhattan | 3,500 / 5,453 | Ceres | 268.7 | 28 | 1783.3 | 56 |
+| MIT | 808 / 827 | arael | 4.50 | 15 | 384.8697 | 36 |
+| MIT | 808 / 827 | Ceres | 49.2 | 50 (cap) | 2437.2 | 40 |
+
+### Incremental
+
+The graph grows in file order and is re-solved after every 100
+constraints, the way karto re-solves as it maps; the time is the total
+over all solves, the cost the one after the last.
+
+| dataset | solves | backend | total time ms | iterations | final cost | peak memory MB |
+|---|---|---|---|---|---|---|
+| M3500 | 55 | arael | 241.6 | 152 | 68.9565 | 46 |
+| M3500 | 55 | Ceres | 1075 | 177 | 68.9731 | 59 |
+| ais2klinik | 168 | arael | 2946 | 1106 | 86.4302 | 76 |
+| ais2klinik | 168 | Ceres | 5723 | 856 | 149.5471 | 118 |
+| city10000 | 207 | arael | 3223 | 544 | 255.9926 | 77 |
+| city10000 | 207 | Ceres | 18175 | 698 | 256.0195 | 125 |
+| CSAIL [1] | 12 | arael | 9.60 | 30 | 30.3837 | 36 |
+| CSAIL [1] | 12 | Ceres | 62.2 | 41 | 30.4480 | 42 |
+| intel | 26 | arael | 43.0 | 69 | 22.2089 | 39 |
+| intel | 26 | Ceres | 265.1 | 160 | 22.2264 | 46 |
+| kitti_00 | 47 | arael | 80.8 | 54 | 49.1237 | 46 |
+| kitti_00 | 47 | Ceres | 553.3 | 161 | 49.3843 | 59 |
+| kitti_02 | 48 | arael | 83.2 | 71 | 39.4042 | 46 |
+| kitti_02 | 48 | Ceres | 363.1 | 52 | 39.6144 | 58 |
+| kitti_05 | 29 | arael | 32.7 | 38 | 78.5419 | 41 |
+| kitti_05 | 29 | Ceres | 176.4 | 56 | 78.5440 | 50 |
+| manhattan | 55 | arael | 210.9 | 126 | 1766.7 | 46 |
+| manhattan | 55 | Ceres | 1274 | 351 | 3294.0 | 60 |
+| MIT | 9 | arael | 7.30 | 23 | 384.8697 | 36 |
+| MIT | 9 | Ceres | 66.5 | 58 | 2425.3 | 40 |
+
+[1] CSAIL's information matrices are near singular. The ScanSolver
+interface passes covariances, and the round trip back to information
+perturbs them; the costs shown are the ones both plugins minimize, which
+differ from a cost computed from the file's own matrices.
